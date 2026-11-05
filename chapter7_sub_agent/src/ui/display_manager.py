@@ -1,5 +1,28 @@
 """
-Display management functionality for outputting content to users.
+输出管理：把内容呈现给用户。
+
+第 3 章 · 输出渲染（DisplayManager）
+====================================
+
+本文件负责一切「往终端写字」的动作。本章真正的技术亮点是流式显示，
+它依赖 rich 的 Live：
+
+    self._live = Live(console=..., refresh_per_second=10)
+    self._live.start()                       # 接管终端，进入「可刷新区域」
+    self._live.update(Markdown(缓冲区全文))    # 每来一块就整段重绘
+    self._live.stop()                        # 交还终端控制权
+
+关键认知：**Live 并不是「追加打印」，而是「反复重绘同一块区域」。**
+所以 print_streaming_content 里必须维护一个累积缓冲区（_stream_buffer），
+每次都把「到目前為止的全部内容」交给 update()。这也解释了为什么流式输出时
+markdown 的列表、代码块能随着内容变多而重新排版——每次都是整篇重新渲染。
+
+代价是：内容越长，每次重绘的开销越大。所以 refresh_per_second 默认 10 而非 60，
+用「稍微降低刷新频率」换「渲染开销可控」。
+
+其余 print_xxx 方法都是「emoji 前缀 + 一行文字」的简单封装，没有特别逻辑，
+只需注意它们统一走 print() 而不是 console.print()——这导致样式与 Console 配置
+不完全一致（属于原项目的取舍，保留原样）。
 """
 
 from rich.console import Console
@@ -9,28 +32,35 @@ from typing import Optional
 
 
 class DisplayManager:
-    """Manages all display operations including streaming content."""
+    """负责所有输出操作，包含流式内容渲染。"""
     
     def __init__(self, console: Optional[Console] = None):
         """
-        Initialize the display manager.
+        初始化显示管理器。
         
-        Args:
-            console: Rich console instance, creates new one if None
+        参数：
+            console：rich 的 Console 实例，不传就新建一个
         """
         self._console = console or Console()
-        self._live: Optional[Live] = None
-        self._stream_buffer: str = ""
+        self._live: Optional[Live] = None       # 流式期间非 None，其余时刻为 None
+        self._stream_buffer: str = ""            # 流式累积缓冲区（整篇重绘的数据来源）
     
+    # ------------------------------------------------------------------
+    # 板块一：普通消息渲染
+    # ------------------------------------------------------------------
     def print_assistant_message(self, content: str, emoji: str = "🤖") -> None:
         """
-        Print assistant message with markdown formatting.
+        用 markdown 格式打印助手消息。
         
-        Args:
-            content: Content to display
-            emoji: Emoji to display before content
+        参数：
+            content：要显示的内容
+            emoji：内容前显示的表情
+
+        用 Markdown() 包一层再交给 rich，模型的 **加粗**、- 列表、```代码块```
+        才会被渲染成真实样式；直接 print 会看到一堆原始符号。
         """
         content = content.strip() if content else ""
+        # 空内容不打印：模型只调工具时 content 为 None，不该出现空的「🤖」气泡
         if content:
             if emoji:
                 print(emoji)
@@ -38,63 +68,82 @@ class DisplayManager:
     
     def print_simple_message(self, message: str, emoji: str = "") -> None:
         """
-        Print a simple message without markdown formatting.
+        打印纯文本消息，不做 markdown 渲染。
         
-        Args:
-            message: Message to display
-            emoji: Optional emoji to display before message
+        参数：
+            message：要显示的消息
+            emoji：消息前的表情（可选）
         """
         if emoji:
             print(f"{emoji} {message}")
         else:
             print(message)
     
+    # ------------------------------------------------------------------
+    # 板块二：流式显示（本章核心）
+    # ------------------------------------------------------------------
     def start_stream_display(self, refresh_rate: int = 10) -> None:
         """
-        Start streaming display mode.
+        进入流式显示模式。
         
-        Args:
-            refresh_rate: Refresh rate per second for live display
+        参数：
+            refresh_rate：每秒重绘次数
+
+        每次开始都先把缓冲区清空 —— 否则上一轮的整段回答会被拼到这一轮前面。
+        Live 的 refresh_per_second 控制重绘频率，不是「语速」，调高只影响流畅度与 CPU 占用。
         """
         self._stream_buffer = ""
         self._live = Live(console=self._console, refresh_per_second=refresh_rate)
         self._live.start()
     
     def stop_stream_display(self) -> None:
-        """Stop streaming display mode."""
+        """退出流式显示模式。
+        
+        必须调用：Live 占着终端时，普通 print 会和重绘区域打架，出现文字重叠。
+        停止后把 _live 置 None，同时起到「状态复位」的作用。
+        """
         if self._live:
             self._live.stop()
             self._live = None
     
     def print_streaming_content(self, chunk: str) -> None:
         """
-        Print streaming content chunk.
+        打印一块流式内容。
         
-        Args:
-            chunk: Content chunk to append and display
+        参数：
+            chunk：要追加并显示的片段
+
+        ★ 两步走：先累加，再整段重绘。
+        这里绝不能写 self._live.update(chunk)——那样只会显示最后一小块。
         """
+        # 防御：极端情况下可能未 start 就被调用，补一个缓冲区的惰性初始化
         if not hasattr(self, "_stream_buffer"):
             self._stream_buffer = ""
         
         self._stream_buffer += chunk
         if self._live:
+            # 传入的是「全文」，让 markdown 每次都基于完整上下文重新排版
             self._live.update(Markdown(self._stream_buffer))
     
     def get_stream_buffer(self) -> str:
-        """Get the current stream buffer content."""
+        """取当前流式缓冲区的内容。供外部（如测试）读取已累积的全文。"""
         return getattr(self, "_stream_buffer", "")
     
     def clear_stream_buffer(self) -> None:
-        """Clear the stream buffer."""
+        """清空流式缓冲区。"""
         self._stream_buffer = ""
     
+    # ------------------------------------------------------------------
+    # 板块三：状态提示（错误 / 成功 / 信息）
+    # 统一结构：有 emoji 就加前缀，没有就裸打印。
+    # ------------------------------------------------------------------
     def print_error(self, error_message: str, emoji: str = "❌") -> None:
         """
-        Print error message with special formatting.
+        打印错误消息（带专门格式）。
         
-        Args:
-            error_message: Error message to display
-            emoji: Emoji to display before error
+        参数：
+            error_message：要显示的错误信息
+            emoji：错误信息前的表情
         """
         if emoji:
             print(f"{emoji} {error_message}")
@@ -103,11 +152,11 @@ class DisplayManager:
     
     def print_success(self, success_message: str, emoji: str = "✅") -> None:
         """
-        Print success message with special formatting.
+        打印成功消息（带专门格式）。
         
-        Args:
-            success_message: Success message to display
-            emoji: Emoji to display before success message
+        参数：
+            success_message：要显示的成功信息
+            emoji：成功信息前的表情
         """
         if emoji:
             print(f"{emoji} {success_message}")
@@ -116,33 +165,46 @@ class DisplayManager:
     
     def print_info(self, info_message: str, emoji: str = "ℹ️") -> None:
         """
-        Print info message.
+        打印提示消息。
         
-        Args:
-            info_message: Info message to display
-            emoji: Emoji to display before info message
+        参数：
+            info_message：要显示的提示信息
+            emoji：提示信息前的表情
         """
         if emoji:
             print(f"{emoji} {info_message}")
         else:
             print(info_message)
 
+    # ------------------------------------------------------------------
+    # 第 6 章新增：待办列表渲染
+    # ------------------------------------------------------------------
     def display_todos(self, todos: list, emoji: str = "📋") -> None:
         """
-        Display todo list with formatting.
+        带格式地展示待办清单。
         
-        Args:
-            todos: List of todo items
-            emoji: Emoji to display before todo list
+        参数：
+            项：待办项列表
+            emoji：清单前显示的表情
+
+        为什么要把这份「好看」当回事？
+        待办列表是模型与用户之间的「契约可视化」——用户能一眼看到
+        「它打算做几件事、现在做到第几步」，信任感与可控感都来自这里。
+        这也是 Claude Code 类产品里 TodoWrite 最大的价值：不是为了模型自己，
+        而是为了让「黑箱执行」变得可见。
+
+        排版细节：{i:2d} 让序号右对齐到 2 位，超过 9 条时也不会错位。
         """
         if not todos:
-            self.print_info("No todos to display", emoji)
+            self.print_info("暂无待办可显示", emoji)
             return
         
+        # 先攒成行列表再一次性打印：避免逐行 print 被流式重绘打断
         output = []
-        output.append("📋 Todo List:")
+        output.append("📋 待办清单：")
         output.append("=" * 50)
         
+        # enumerate(..., 1) 从 1 开始编号，符合人类阅读习惯
         for i, todo in enumerate(todos, 1):
             status_icon = self._get_status_icon(todo['status'])
             content = todo['content']
@@ -151,19 +213,23 @@ class DisplayManager:
             output.append(f"{i:2d}. {status_icon} [{todo_id}] {content}")
         
         output.append("=" * 50)
-        output.append(f"Total: {len(todos)} todos")
+        output.append(f"共 {len(todos)} 项")
         
+        # 用 print_simple_message 而非 markdown：表格类文本交给 markdown 渲染反而会变形
         self.print_simple_message("\n".join(output))
     
     def _get_status_icon(self, status: str) -> str:
         """
-        Get icon for todo status.
+        取某个状态对应的图标。
         
-        Args:
-            status: Todo status
+        参数：
+            status：待办状态
             
-        Returns:
-            Icon string for the status
+        返回：
+            该状态对应的图标字符
+
+        用 dict 做「状态 → 图标」映射，比 if/elif 链更易扩展；
+        .get(status, '❓') 保证遇到未知状态也不崩（防御式默认值）。
         """
         icons = {
             'pending': '⏳',

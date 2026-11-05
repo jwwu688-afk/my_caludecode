@@ -78,7 +78,7 @@ QuickStar CLI → MCP客户端 → MCP服务器（天气、计算器等）
    - 提供天气预报和预警功能
    - 工具：`get_forecast`、`get_alerts`
 
-2. **计算器服务器** (`src/mcp_servers/caculator.py`)
+2. **计算器服务器** (`src/mcp_servers/calculator.py`)
    - 提供数学计算功能
    - 工具：`adder`用于基本算术运算
 
@@ -104,7 +104,7 @@ chapter8_mcp_client/
 │   └── mcp_servers/            # 新增：示例MCP服务器
 │       ├── mcp.json           # 服务器配置
 │       ├── weather.py         # 天气MCP服务器
-│       └── caculator.py       # 计算器MCP服务器
+│       └── calculator.py       # 计算器MCP服务器
 ```
 
 ### 🔄 工作原理
@@ -117,3 +117,17 @@ chapter8_mcp_client/
 6. **响应**：MCP工具的结果被处理并呈现给用户
 
 此实现展示了MCP如何扩展AI助手的功能，同时在核心功能和外部集成之间保持清晰的分离。
+
+### 🔒 委托权限（沿用第 7 章）
+
+本章继承了第 7 章的限制：**只有主智能体可以调用 `task`，子智能体不能再委托**。
+MCP 工具（`get_alerts` / `get_forecast` / `adder`）对子智能体照常开放，
+唯独 `task` 会被摘掉：
+
+```
+主智能体：7 个工具（4 内置 + 3 MCP）
+子智能体：6 个工具（task 被过滤）
+```
+
+两道闸门：`Conversation._get_available_tools()` 在 schema 层过滤，
+`Task.act()` 在运行层再拦一次。

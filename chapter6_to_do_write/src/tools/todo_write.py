@@ -1,11 +1,68 @@
+# -*- coding: utf-8 -*-
+"""
+第 6 章 · 待办工具（TodoWrite）
+===============================
+
+这是本章的主角：一个「不产生任何外部副作用」的工具，却让 Agent 从
+「走一步看一步的脚本」变成「有计划的执行者」。
+
+为什么一个只改内存列表的工具如此重要？三个层次的原因：
+
+  1. **对外可解释**：用户能看到「它打算做 5 件事，现在第 3 件」。
+     没有这个，Agent 就是个黑箱——你不知道它在干什么、还要多久。
+
+  2. **对内抗遗忘**：模型每次重读历史时，都会看到最新的 todo，
+     于是不会因为上下文太长而忘记任务主干（配合 reminder.py 每轮提醒）。
+
+  3. **强制拆解**：schema 要求「每条必须有 content/status/id」，
+     这迫使模型在动手前先把任务想清楚、切成可验证的小步。
+     很多失败不是因为模型不会做，而是因为它没想清楚要做几步。
+
+本工具的三段结构，正好对应「Agent 工具」的标准范式：
+    act()        —— 执行：校验 → 落状态 → 通知 UI → 回报结果
+    json_schema  —— 契约：参数类型、枚举、必填项
+    _tool_description —— 说明书：什么时候该用、什么时候不该用（含大量示例）
+
+【语法卡片：这份文件用到的 5 个 Python 写法】
+
+    ① isinstance(x, list)
+       判断「x 是不是列表类型」，返回 True/False。
+       校验参数时天天用：if not isinstance(todos, list): return "类型错"
+
+    ② type(x).__name__
+       取出 x 的类型名，比如 "dict"、"str"、"list"。
+       拼进错误信息里，模型就知道自己传错成什么了。
+
+    ③ enumerate(列表, 起始值)
+       遍历时同时拿到「下标」和「元素」：
+           for i, todo in enumerate(todos):
+               print(i, todo)     # 0 {...}、1 {...}
+       比 for i in range(len(...)) 更直观。
+
+    ④ f"第 {i} 项错了，内容是 {todo}"
+       字符串前面加 f，花括号里可以直接写变量或表达式，会被替换成值。
+
+    ⑤ json.dumps(对象, indent=2)
+       把 Python 对象转成 JSON 文本；indent=2 表示缩进两格（给人看更清楚）。
+       它的反向操作叫 json.loads(文本)。
+
+补充：为什么 act 里的错误全都 `return "..."` 而不是 `raise`？
+    因为返回值会作为「工具结果」交回模型；模型读到具体错误后能自己改正。
+    一旦 raise，整个循环就被打断了，模型连解释的机会都没有。
+"""
+
 import json
-from tools.base_agent import BaseAgent
+from .base_agent import BaseAgent
 from ui.ui_manager import UIManager
 
 class TodoWrite(BaseAgent):
     def __init__(self):
         super().__init__()
+        # ★ 全部待办存在内存里。工具实例由 ToolManager 单例持有，
+        #   因此这份列表能跨轮存活；一旦进程退出就没了（不需要持久化）。
         self.todos = []
+        # 工具直接持有 UI：本章需要一个「立刻把清单画出来」的通道。
+        # 严格分层下应该用事件回调，这里为了直观直接引用（小设计债）。
         self._ui_manager = UIManager()
 
     @staticmethod
@@ -13,33 +70,108 @@ class TodoWrite(BaseAgent):
         return "todo_write"
 
     def act(self, todos=None):
-        if not todos:
-            return "No todos provided"
+        """
+        用「整份列表覆盖」的方式更新待办。
+
+        参数：
+            todos: 待办数组，每项形如 {"content": "...", "status": "pending", "id": "1"}
+
+        返回：
+            str: 成功或错误说明，会作为工具结果回灌给模型。
+
+        ★ 注意这是**全量覆盖**而非增量合并（self.todos = todos）。
+        为什么不做增量？因为增量要处理「新增/删除/改状态/换顺序」四类操作，
+        模型很容易用错；而「每次把完整列表重新发一遍」语义最简单，
+        模型只需保证「这次发的就是我要的最终状态」。
+        代价是 token 消耗略高（列表长时要重发），这是刻意用冗余换确定性。
+
+        校验部分是全章的「质量门控」：宁可返回错误让模型重发，
+        也不接受一份格式可疑的清单——因为脏数据会污染后续所有推理。
+
+        【模型实际传进来的 JSON 长这样】
+
+            todos = [
+                {"content": "读取配置文件",   "status": "completed",   "id": "1"},
+                {"content": "修改超时设置",   "status": "in_progress", "id": "2"},
+                {"content": "跑一遍回归测试", "status": "pending",     "id": "3"},
+            ]
+
+        注意每次调用都要把**完整的 3 条**重发一遍，哪怕只改了第 2 条的状态。
+        这是「全量覆盖」的代价，也是它的确定性来源。
+
+        【四层校验如何逐层拦下坏数据】
+
+            第 1 层  if not todos
+                     拦：模型传了 None / [] / 空字符串
+                     理由：没有待办就没有意义，也防止空对象把已有清单清空
+
+            第 2 层  not isinstance(todos, list)
+                     拦：模型传成 {"todos": [...]}（把整个对象塞进来了）
+                     处理：返回错误，并回显「实际类型 + 实际值」让模型照着改
+
+            第 3 层  not isinstance(todo, dict)
+                     拦：列表里塞了字符串，如 ["读书"]
+                     处理：指出是第几项错了
+
+            第 4 层  status 不在三态里
+                     拦：模型写 "done" / "已完成" / "进行中"
+                     为什么必须拦：status 后面要映射成图标（⏳🔄✅），
+                     出现任何变体都会静默变成 ❓，整块 UI 就废了
+
+        所有错误都「返回字符串」而不是抛异常 —— 因为返回值会作为工具结果
+        回到模型手里，它读到具体错在哪，下一轮就能自己改对。
+        这比抛异常打断整个循环有用得多。
+        """
+        # 空调用直接拒绝：没有待办就没有意义，也防止模型误传空对象覆盖已有清单
+        if not todos:                                     # None / [] / 空字符串都算空
+            return "No todos provided"                    # 直接返回错误文本给模型
         
-        # Validate todos type
-        if not isinstance(todos, list):
+        # 校验 todos 的类型
+        # 校验一：必须是列表。错误信息里带上「实际类型 + 实际值」，
+        # 这样模型能看到自己到底传了什么，从而精确修正（这比只说 "invalid" 有用得多）。
+        if not isinstance(todos, list):                   # 传进来的不是列表
             return f"Error: todos type is wrong. Expected list, got {type(todos).__name__}. todos = {todos}"
         
-        for i, todo in enumerate(todos):
-            if not isinstance(todo, dict):
+        for i, todo in enumerate(todos):                  # i=第几项，todo=该项内容
+            # 校验二：每一项必须是 dict
+            if not isinstance(todo, dict):                # 列表里塞了字符串之类
                 return f"Error: todo item {i} type is wrong. Expected dict, got {type(todo).__name__}. todos = {todos}"
             
-            required_fields = ['content', 'status', 'id']
-            for field in required_fields:
-                if field not in todo:
+            # 校验三：三个必填字段一个都不能少
+            required_fields = ['content', 'status', 'id'] # 缺一个都不算合格
+            for field in required_fields:                 # 逐个检查
+                if field not in todo:                     # 这个字段没给
                     return f"Error: todo item {i} missing required field '{field}'. todos = {todos}"
             
-            if todo['status'] not in ['pending', 'in_progress', 'completed']:
+            # 校验四：status 只能是三态之一。
+            # 这条很关键：状态字符串是后续 UI 图标映射与提醒逻辑的依据，
+            # 一旦出现 "done" / "已完成" 这类变体，整条链路都会静默出错。
+            if todo['status'] not in ['pending', 'in_progress', 'completed']:   # 白名单之外一律拒绝
                 return f"Error: todo item {i} has invalid status '{todo['status']}'. Must be one of: pending, in_progress, completed. todos = {todos}"
         
-        self.todos = todos
+        # 校验全过才落状态——「要么全成功，要么完全不动」
+        self.todos = todos                                # 全量覆盖：这份就是最终清单
         
-        # Display the updated todos using UI manager
-        self._ui_manager.display_todos(todos)
+        # 用 UI 管理器把更新后的清单画出来
+        # 立刻渲染：让用户看到进度，是 todo 存在的首要意义
+        self._ui_manager.display_todos(todos)             # 打印带图标的三状态清单
         
-        return f"Successfully updated todo list with {len(todos)} todos"
+        return f"Successfully updated todo list with {len(todos)} todos"   # 告诉模型「成功，共 N 条」
 
     def json_schema(self):
+        """
+        参数契约。本章的 schema 比前几章严格得多，值得逐项看：
+
+          - content 有 minLength: 1 —— 禁止空字符串任务（空任务等于没拆解）
+          - status 用 enum 三态     —— 从源头堵住 "done" 之类的变体
+          - items 上 additionalProperties: False —— 禁止模型塞自定义字段
+          - 顶层也有 additionalProperties: False —— 连包装层都不许乱加
+          - required 三个字段全必填 —— 不允许「只传 content 让我猜状态」
+
+        additionalProperties: False 是个容易被忽视的强约束：
+        它让「模型自作聪明加字段」直接变成协议层错误，而不是悄悄通过、
+        然后在某处引发难以定位的 bug。
+        """
         return {
             "type": "function",
             "function": {
@@ -88,11 +220,39 @@ class TodoWrite(BaseAgent):
         }
     
     def get_status(self):
+        """
+        供 reminder.py 每轮读取的状态快照。
+
+        返回 JSON 而非纯文本，原因有两个：
+          - 结构清晰，模型容易解析出「哪条还在 in_progress」；
+          - indent=2 让它在 prompt 里可读性更好（模型对缩进敏感度不高，但人能看懂便于调试）。
+        """
+        # 空列表时给一句自然语言：比返回 "[]" 更能让模型明白「你还没建清单」
         if not self.todos:
             return "No todos in memory - no todos have been added yet"
         return json.dumps({"todos": self.todos}, indent=2)
 
-    # adapt from claude code
+    # ------------------------------------------------------------------
+    # 第 6 章核心：给模型看的「使用说明书」
+    # ------------------------------------------------------------------
+    # 这份文档的结构值得当作 prompt 工程范本反复阅读：
+    #
+    #   When to Use      —— 6 条正向触发条件（3 步以上、用户明确要、收到新指令…）
+    #   When NOT to Use  —— 4 条反向条件（单步、琐碎、纯问答…）
+    #   Examples (该用)  —— 4 个正例 + 每个都附 <reasoning> 解释「为什么用」
+    #   Examples (不该用)—— 4 个反例 + 同样附 <reasoning> 解释「为什么不用」
+    #   Task States      —— 三态定义 + 「同时只能有一个 in_progress」
+    #   Completion Rules —— 什么情况**不许**标记完成（测试挂了、只做一半…）
+    #
+    # 三个高级技巧：
+    #   1) 正反例配对。只给正例，模型会过度使用；只给规则，模型理解不深。
+    #      正例教「长什么样」，反例教「边界在哪」，<reasoning> 教「判断依据」。
+    #   2) 把「软要求」写成硬规则，如 "limit to ONE task at a time"。
+    #      这类约束能直接消灭「一次把五件事都标成 in_progress」的典型错误。
+    #   3) Completion Gate：明确列出「测试失败/实现不全/有未解错误」时不得标记完成。
+    #      这是防「模型自我表扬提前收工」的最有效手段——本章最重要的工程经验之一。
+    #
+    # 改编自 Claude Code
     def _tool_description(self):
         return """
 Use this tool to create and manage a structured task list for your current coding session. This helps you track progress, organize complex tasks, and demonstrate thoroughness to the user.

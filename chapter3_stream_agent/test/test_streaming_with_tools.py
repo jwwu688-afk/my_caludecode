@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Test streaming functionality with tool calls
+测试「流式 + 工具调用」的组合
 """
 import sys
 import os
 
-# Add src directory to path
+# 把 src 目录加入模块搜索路径
 current_dir = os.path.dirname(os.path.abspath(__file__))
 src_path = os.path.join(current_dir, '../src')
 sys.path.insert(0, src_path)
@@ -14,14 +14,14 @@ from core.api_client import APIClient
 from tools.tool_manager import ToolManager
 
 def test_streaming_with_tools():
-    """Test streaming with tool calls"""
+    """测试带工具调用的流式"""
     print("🧪 Testing streaming functionality with tools...")
     
     try:
         client = APIClient()
         tool_manager = ToolManager()
         
-        # Test request that should trigger a tool call
+        # 这个请求应当触发一次工具调用
         request_params = {
             "messages": [
                 {"role": "system", "content": "You are a helpful assistant."},

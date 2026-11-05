@@ -1,3 +1,19 @@
+# -*- coding: utf-8 -*-
+"""
+第 2 章 · 命令执行工具（CmdRunner）
+===================================
+
+★ 第 7 章改动：基类 BaseAgent → BaseTool，act 改为 async def。
+
+这是「全链路异步化」的一部分，原因见 base_tool.py：Task 工具需要在工具内部
+await 一整个子对话，于是所有工具的 act 都统一成协程，调度层才能保持一致。
+
+注意：在 async def 里执行 subprocess.run 仍然是**阻塞**的——
+它会把事件循环卡住直到命令跑完。子智能体并发场景下这是真实瓶颈，
+只是本项目受限于「一次只跑一个工具」的顺序执行模型，所以尚未暴露。
+真要并发，应该改用 asyncio.create_subprocess_shell。
+"""
+
 import subprocess
 from tools.base_tool import BaseTool
 
@@ -7,22 +23,45 @@ class CmdRunner(BaseTool):
 
     @staticmethod
     def get_tool_name():
+        # 用 staticmethod：名字是「类级别的常量」，不需要实例状态，
+        # 这样 ToolManager 在注册阶段就能用 CmdRunner.get_tool_name() 拿到，无需先建实例。
         return "cmd_runner"
 
     async def act(self, command="", timeout=30):
+        """
+        执行一条 shell 命令。
+
+        参数：
+            command: 待执行的命令字符串
+            timeout: 超时秒数
+
+        返回：
+            str: 正常时返回 stdout；失败时返回以 "Error:" 开头的 stderr，或异常描述。
+
+        注意形参里没有 need_user_approve —— 它只是 schema 里的「控制位」，
+        在 Conversation 层就被剥离了，不该出现在这里。
+        """
         if not command:
+            # 参数缺失时给模型一条可读的提示，模型下一轮通常会补上参数
             return "No command provided"
         
         try:
             result = subprocess.run(
                 command, 
+                # shell=True：允许 `ls | grep x`、`cd .. && ls` 这类 shell 语法。
+                # ⚠️ 安全代价很大：等于把整台机器的 shell 交给模型，
+                # 这也是本章必须要有 need_user_approve 人工审批的原因。
                 shell=True, 
+                # 捕获输出，避免直接刷屏；text=True 让返回值是 str 而非 bytes，方便 JSON 序列化
                 capture_output=True, 
                 text=True, 
-                timeout=30
+                timeout=30        # 与形参 timeout 不一致（硬编码 30），原样保留
             )
             
+            # 用返回码而非「有没有输出」判断成败：很多命令成功时无输出（如 mkdir）
             if result.returncode == 0:
+                # 本章新增：命令成功但没有任何输出时，返回一句人能看懂的话。
+                # 否则会和模型返回空字符串，它可能误判成「工具坏了」而反复重试同一个命令。
                 if result.stdout.strip():
                     return result.stdout
                 else:
@@ -30,12 +69,28 @@ class CmdRunner(BaseTool):
             else:
                 return f"Error: {result.stderr}"
         except subprocess.TimeoutExpired:
+            # 超时是「预期内」的失败，单独分支，避免长时间卡死主流程
             return "Command timed out"
         except Exception as e:
-            self.status = "error"
+            self.status = "error"     # 记录状态，供 UI 层展示（本章尚未消费）
             return f"cmd_runner Exception: {str(e)}"
 
     def json_schema(self):
+        """
+        返回 OpenAI 兼容的 function schema。
+
+        ★ 第 5 章改名：tool_description() → json_schema()。
+        名字更准确——它返回的确实是 JSON Schema 结构；
+        而真正的「长文案说明」被移到了 _tool_description()，由 description 字段引用。
+
+        写法要点：
+          - properties 里的 need_user_approve 是本项目自定义扩展字段，
+            协议不认识它，由 Conversation 自行读取并处理；
+          - required 里带上它，等于强制模型每次都必须显式表态；
+          - description 不再是几句话，而是一整篇「操作手册」——
+            因为本章给模型的自由度提高了（教它怎么读文件、怎么用 sed 改文件），
+            约束就得同步变细。
+        """
         return {
                 "type": "function",
                 "function": {
@@ -65,10 +120,24 @@ class CmdRunner(BaseTool):
             }
     
     def get_status(self):
+       # 本章的 UI 还没有状态栏，先返回空字符串占位（第 6 章会被 TodoWrite 用来展示进度）
        return ""
-    
 
-    # TODO: Read and Edit file will separate as serval tools
+
+    # ------------------------------------------------------------------
+    # 第 5 章新增：给模型看的「操作手册」
+    # ------------------------------------------------------------------
+    # 这段长文本是整个工具的灵魂：不是描述「这个工具能跑命令」，
+    # 而是教模型「在什么场景下该跑什么命令、危险命令怎么标记、改文件优先用 sed」。
+    # 经验规律：工具的能力上限往往不由实现决定，而由这段说明的清晰度决定。
+    # 下面三点值得留意：
+    #   1) Security Check —— 明确列出危险命令清单（rm/sudo/chmod 777…），
+    #      比笼统说「危险的要审批」有效得多；
+    #   2) Directory Verification —— 要求 mkdir 前先 ls 确认父目录，
+    #      这是把「人类常识」显式写成步骤；
+    #   3) Edit File Command —— 强制「先读后改」，并使用带行号的 sed 精确替换，
+    #      避免模型整文件重写导致格式与注释丢失。
+    # TODO：读文件与改文件以后应拆成独立的工具
     def _tool_description(self):
      return """
 Executes a given bash command in a persistent shell session with optional timeout, user approval, and security measures.

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Test the full conversation flow with streaming
+测试带流式的完整对话流程
 """
 import sys
 import os
 import asyncio
 
-# Add src directory to path
+# 把 src 目录加入模块搜索路径
 current_dir = os.path.dirname(os.path.abspath(__file__))
 src_path = os.path.join(current_dir, '../src')
 sys.path.insert(0, src_path)
@@ -14,13 +14,13 @@ sys.path.insert(0, src_path)
 from core.conversation import Conversation
 
 async def test_conversation_integration():
-    """Test that conversation class can handle streaming properly"""
+    """测试对话类能否正确处理流式"""
     print("🧪 Testing conversation streaming integration...")
     
     try:
         conv = Conversation()
         
-        # Test the streaming message handling directly
+        # 直接测试流式消息处理
         conv.messages = [
             {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": "Say hello briefly"}
@@ -28,13 +28,13 @@ async def test_conversation_integration():
         
         print("📡 Testing recursive_message_handling with streaming...")
         
-        # Simulate one round of message handling
-        # This should use streaming internally
+        # 模拟一轮消息处理
+        # 内部应当走流式
         
-        # We can't easily test the full interactive flow without user input,
-        # but we can test that the methods exist and work
+        # 没有真实用户输入时，完整交互流程不好测，
+        # 但可以验证这些方法存在且能正常调用
         
-        # Test that streaming methods exist
+        # 测试流式方法是否存在
         api_client = conv._api_client
         if hasattr(api_client, 'get_completion_stream'):
             print("✅ Streaming API method available")
@@ -48,14 +48,14 @@ async def test_conversation_integration():
             print("❌ Streaming print method missing")
             return False
             
-        # Test streaming content printing
+        # 测试流式内容打印
         print("📝 Testing streaming content display:")
         print("🤖 ", end="", flush=True)
         test_content = "This is a test of streaming content display."
         for char in test_content:
             conv.print_streaming_content(char)
-            await asyncio.sleep(0.01)  # Small delay to simulate streaming
-        print()  # New line
+            await asyncio.sleep(0.01)  # 加一点延迟，模拟真实流式
+        print()  # 换行
         
         print("🎉 Conversation streaming integration test passed!")
         return True

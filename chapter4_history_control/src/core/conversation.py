@@ -1,5 +1,25 @@
 """
-Conversation management with refactored UI components and history manager integration.
+对话管理：UI 组件已重构，并接入历史管理器。
+
+第 4 章 · 对话管理（接入历史管理器）
+====================================
+
+本章对 Conversation 做了三处结构性改造，都是为了让「上下文」变成可管理的资源：
+
+  1. **不再自己持有 messages**：改为通过 property 转发给 HistoryManager。
+     业务代码依旧写 self.messages / self.add_message(...)，但真实存储在别人家里，
+     于是「压缩」就能在一处生效、全局可见。
+
+  2. **消息体改成 content 块数组**：
+         {"role": "user", "content": [{"type": "text", "text": "..."}]}
+     这是 Anthropic 风格的多模态结构（文本/图片/文档都是块）。
+     OpenAI 传统的纯字符串写法也能跑，但块结构才能承载 cache_control 这类元信息。
+
+  3. **每轮记录 token 用量并打印上下文占用**：让「快撑爆了」这件事对用户可见。
+
+另外新增了 prompt caching 的标记（_get_messages_with_cache_mark）：
+给最后一条消息的最后一个内容块打上 {"cache_control": {"type": "ephemeral"}}，
+服务端会把这之前的前缀缓存起来，后续请求命中缓存可显著省钱省时。
 """
 
 import json
@@ -12,9 +32,12 @@ from .history.history_manager import HistoryManager
 
 class Conversation:
     """
-    Main conversation class that handles the chat flow and tool interactions.
-    UI responsibilities have been extracted to the UIManager.
-    History management is handled by the HistoryManager.
+    对话主类：负责聊天流程与工具交互。
+    界面职责已全部抽到 UIManager。
+    历史记录由 HistoryManager 负责。
+
+    此时 Conversation 变成纯粹的「协调者」：
+    自己不再保存任何状态，只负责把四个协作者串起来。
     """
     
     _instance = None
@@ -25,33 +48,46 @@ class Conversation:
     _history_manager = None
 
     def __new__(cls):
-        """Singleton pattern implementation."""
+        """单例模式实现。"""
         if cls._instance is None:
             cls._instance = super(Conversation, cls).__new__(cls)
         return cls._instance
     
     def __init__(self):
-        """Initialize the conversation with required managers."""
+        """初始化对话所需的各个管理器。"""
         if not self._initialized:
             self._tool_manager = ToolManager()
             self._api_client = APIClient()
             self._ui_manager = UIManager()
+            # 注意这里不再有 self.messages = []
             self._history_manager = HistoryManager()
             self._initialized = True
 
     @property
     def messages(self):
-        """Get current messages from history manager."""
+        """
+        从历史管理器取当前消息列表。
+
+        ★ 每次读取都返回一份 deepcopy（HistoryManager 里的实现）。
+        所以 `self.messages.append(x)` 这种写法在本章是**无效的**——
+        你改的是副本。必须走 add_message()。这是「只读属性 + 显式写方法」的经典约束：
+        用一次踩坑换取「历史只能从一个入口修改」，从而保证压缩逻辑不被绕过。
+        """
         return self._history_manager.get_current_messages()
     
     
     def add_message(self, message):
-        """Add message through history manager."""
+        """通过历史管理器追加一条消息。"""
         self._history_manager.add_message(message)
 
     async def start_conversation(self):
-        """Start a new conversation."""
-        # Initialize with system message
+        """
+        开启一次新会话。
+
+        与第 3 章的差异：不再清空 self.messages（HistoryManager 构造时已给空列表），
+        且消息体改用 content 块数组形式。
+        """
+        # 用系统消息初始化
         system_message = {
             "role": "system", 
             "content": [
@@ -72,89 +108,103 @@ class Conversation:
         try:
             await self._recursive_message_handling()
         except Exception as e:
-            self._ui_manager.print_error(f"System error: {e}")
+            self._ui_manager.print_error(f"系统错误：{e}")
             traceback.print_exc()
 
     async def _recursive_message_handling(self):
         """
-        Recursively handle messages with streaming support and token usage tracking.
-        This is the main conversation loop.
+        递归处理消息：支持流式，并记录 token 用量。
+        这就是对话主循环。
+
+        与第 3 章相比，多了两个「压缩时机」：
+            ① 请求前压一次（若上一轮已经顶到阈值，先瘦身再发，避免这次直接超限）
+            ② 响应后再压一次（本轮新增了消息，可能刚好跨过阈值）
+        这种「进出门各检查一次」的写法，比只在某处检查更稳妥。
         """
 
-        # Check for auto compression
+        # 检查是否需要自动压缩
+        # 时机 ①：发请求之前。放在最前面，确保 request 里带的是压缩后的历史
         self._history_manager.auto_messages_compression()
 
         request = {
+            # 注意用的是打了缓存标记的版本，而不是 self.messages
             "messages": self._get_messages_with_cache_mark(),
             "tools": self._tool_manager.get_tools_description(),
         }
         
-        # Start assistant response
+        # 开始输出助手回复
         self._ui_manager.print_simple_message("", "🤖")
         
-        # Use streaming API for response
+        # 用流式接口获取回复
         try:
             stream_generator = self._api_client.get_completion_stream(request)
             
-            # Validate stream generator
+            # 校验流式生成器
             if stream_generator is None:
-                raise Exception("Stream generator is None - API client returned no response")
+                raise Exception("流式生成器为 None：API 客户端没有返回内容")
             
             response_message = None
             full_content = ""
             token_usage = None
             
-            # Ensure stream_generator is iterable
+            # 确认生成器可迭代
             try:
                 iterator = iter(stream_generator)
             except TypeError:
-                raise Exception(f"Stream generator is not iterable. Type: {type(stream_generator)}")
+                raise Exception(f"流式生成器不可迭代，实际类型：{type(stream_generator)}")
             
-            # Start streaming display
+            # 进入流式显示
             self._ui_manager.start_stream_display()
             
-            # Process streaming response
+            # 处理流式响应
+            # ★ 三分支判定（比第 3 章的 isinstance(str) 二分支更严谨）：
+            #   str                                      → 正文片段
+            #   有 role == 'assistant'                    → 最终消息，收下并 break
+            #   只有 usage                               → 纯用量包，单独记录后继续
+            # 判断顺序很重要：必须先用 role 排除「最终消息」，
+            # 因为最终消息上也可能挂着 usage（第 4 章 api_client 会 message.usage = ...）。
             for chunk in iterator:
                 if isinstance(chunk, str):
-                    # This is content chunk
+                    # 这是正文片段
                     full_content += chunk
                     self._ui_manager.print_streaming_content(chunk)
                 elif hasattr(chunk, 'role') and chunk.role == 'assistant':
-                    # This is the final message object (ChatCompletionMessage)
+                    # 这是最终的消息对象（ChatCompletionMessage）
                     response_message = chunk
-                    # Extract usage information if present
+                    # 有用量信息就取出来
                     if hasattr(chunk, 'usage') and chunk.usage:
                         token_usage = chunk.usage
                     break
                 elif hasattr(chunk, 'usage') and chunk.usage:
-                    # This is standalone token usage information
+                    # 这是单独的 token 用量包
                     token_usage = chunk.usage
 
-            # End streaming display
+            # 结束流式显示
             self._ui_manager.stop_stream_display()
             
-            # If no complete response message, create one
+            # 没有拿到完整消息时，自己拼一个兜底
             if response_message is None:
                 response_message = self._create_simple_message(full_content)
             
         except Exception as e:
-            self._ui_manager.print_error(f"Streaming response handling error: {e}")
-            self._ui_manager.print_info(f"Error type: {type(e).__name__}")
+            self._ui_manager.print_error(f"流式响应处理出错：{e}")
+            self._ui_manager.print_info(f"错误类型：{type(e).__name__}")
             traceback.print_exc()
             
-            # Fallback to non-streaming mode
+            # 降级到非流式模式
             try:
-                self._ui_manager.print_info("Trying non-streaming mode...")
+                self._ui_manager.print_info("正在尝试降级到非流式模式……")
+                # ★ 接口变更：本章 get_completion 返回二元组，必须解包
                 response_message, token_usage = self._api_client.get_completion(request)
                 self._ui_manager.print_assistant_message(response_message.content)
                 
-                # Update token usage in history manager
+                # 把本轮用量写进历史管理器
                 if token_usage:
                     self._history_manager.update_token_usage(token_usage)
                     
             except Exception as fallback_error:
-                self._ui_manager.print_error(f"Non-streaming mode also failed: {fallback_error}")
-                # Create error response
+                self._ui_manager.print_error(f"非流式模式也失败了：{fallback_error}")
+                # 构造一条错误消息
                 response_message = self._create_error_message(str(e))
                 self._ui_manager.print_assistant_message(response_message.content)
                 return
@@ -162,7 +212,9 @@ class Conversation:
         if token_usage:
                 self._history_manager.update_token_usage(token_usage)
         
-        # Add response to message history through history manager
+        # 通过历史管理器把回复写进历史
+        # 手工构造 dict 而非 append pydantic 对象：
+        # 因为 HistoryManager 的压缩逻辑依赖 msg.role / msg["content"] 的可预测结构。
         assistant_message = {
             "role": "assistant",
             "content": response_message.content,
@@ -170,18 +222,20 @@ class Conversation:
         }
         self.add_message(assistant_message)
         
-        # Check for auto compression
+        # 检查是否需要自动压缩
+        # 时机 ②：刚写入本轮回复，可能已经越线，立刻压一次
         self._history_manager.auto_messages_compression()
 
-        # Handle tool calls
+        # 处理工具调用
         if hasattr(response_message, 'tool_calls') and response_message.tool_calls is not None and len(response_message.tool_calls) > 0:
             await self._handle_tool_calls(response_message.tool_calls)
-            # Update token usage in history manager
+            # 把本轮用量写进历史管理器
+            # 打印「上下文占用 % + 累计花费 $」，数值来自 HistoryManager 与 APIClient 两个来源
             self._print_context_window_and_total_cost()
             await self._recursive_message_handling()
         else:
             self._print_context_window_and_total_cost()
-            # No tool calls, wait for user input
+            # 没有工具调用，等用户下一句
             user_input = await self._ui_manager.get_user_input()
             user_message = {
                 "role": "user", 
@@ -193,23 +247,40 @@ class Conversation:
             await self._recursive_message_handling()
 
     def _print_context_window_and_total_cost(self):
-        self._ui_manager.print_simple_message(f"(context window: {self._history_manager.current_context_window}%, total cost: {self._api_client.total_cost}$)")
-    
+        """
+        一行状态栏。注意 current_context_window 已经是「格式化好的字符串」，
+        这里只管拼接展示，不再做数值格式化——职责划分清晰。
+        """
+        self._ui_manager.print_simple_message(f"（上下文占用：{self._history_manager.current_context_window}%，累计花费：{self._api_client.total_cost}$)")
 
     def _get_messages_with_cache_mark(self):
-        """Get messages with cache mark."""
+        """
+        取消息，并打上缓存标记。
+
+        Prompt Caching 的机制：给「前缀的最后一块」打标记，
+        服务端会把从开头到这里的全部内容缓存下来；下次请求只要前缀一致，
+        这部分就不必重新计费/计算，只算增量部分。
+
+        实现要点：
+          - 只给「最后一条消息的最后一个内容块」打标记；
+          - 因为 messages 是 deepcopy，标记只存在于本次请求，不会污染存档历史；
+            若直接改存档，标记会一轮轮累积，最终把请求体撑大甚至报错。
+          - 这就是 HistoryManager.get_current_messages() 必须 deepcopy 的原因。
+        """
         messages = self._history_manager.get_current_messages()                                                                     
+        # 三重防御：非空、有 content 键、content 非空，才去摸 [-1]["content"][-1]
         if messages and "content" in messages[-1] and messages[-1]["content"]:                                                      
             messages[-1]["content"][-1]["cache_control"] = {"type": "ephemeral"}                                                    
         return messages  
 
     async def _handle_tool_calls(self, tool_calls):
-        """Handle tool calls with user approval when needed."""
+        """处理工具调用，必要时先请用户审批。"""
         for tool_call in tool_calls:
             try:
                 args = json.loads(tool_call.function.arguments)
             except json.JSONDecodeError as e:
-                self._ui_manager.print_error(f"Failed to parse tool arguments: {e}")
+                self._ui_manager.print_error(f"工具参数解析失败：{e}")
+                # 失败分支也走 content 块结构，保持历史里所有消息「同一形状」
                 tool_response = {
                     "role": "tool",
                     "tool_call_id": tool_call.id,
@@ -221,12 +292,12 @@ class Conversation:
                 self.add_message(tool_response)
                 continue
 
-            # Check if user approval is needed
+            # 判断是否需要用户审批
             need_user_approve = args.get('need_user_approve', False)
             should_execute = True
 
             if need_user_approve:
-                approval_content = f"Tool: {tool_call.function.name}, arguments: {args}"
+                approval_content = f"工具：{tool_call.function.name}，参数：{args}"
                 should_execute = await self._ui_manager.wait_for_user_approval(approval_content)
 
             if should_execute:
@@ -235,7 +306,8 @@ class Conversation:
                 self._add_tool_response(tool_call, "user denied to execute tool")
 
     async def _execute_tool(self, tool_call, args):
-        """Execute a tool call and handle the response."""
+        """执行一次工具调用并处理返回结果。"""
+        # 剥离框架控制位，只把业务参数交给工具
         tool_args = {k: v for k, v in args.items() if k != 'need_user_approve'}
         self._ui_manager.show_preparing_tool(tool_call.function.name, tool_args)
         
@@ -249,7 +321,8 @@ class Conversation:
             )
             self._add_tool_response(tool_call, json.dumps(tool_response))
         except Exception as e:
-            # Enhanced error handling for tool execution
+            # 工具执行的加强版错误处理
+            # 失败原因回灌给模型，让它自行决定重试或改道（Agent 自愈）
             self._ui_manager.show_tool_execution(
                 tool_call.function.name, 
                 tool_args, 
@@ -259,7 +332,8 @@ class Conversation:
             self._add_tool_response(tool_call, f"tool call failed, fail reason: {str(e)}")
 
     def _add_tool_response(self, tool_call, content):
-        """Add tool response to message history through history manager."""
+        """通过历史管理器把工具结果写进历史。"""
+        # 统一走这里，保证 tool_call_id 一定带上，且 content 一定是块数组
         tool_message = {
             "role": "tool",
             "tool_call_id": tool_call.id,
@@ -271,7 +345,7 @@ class Conversation:
         self.add_message(tool_message)
 
     def _create_simple_message(self, content):
-        """Create a simple message object."""
+        """构造一条简单的消息对象。鸭子类型兜底：只需提供下游用到的三个属性。"""
         class SimpleMessage:
             def __init__(self, content):
                 self.content = content
@@ -281,15 +355,20 @@ class Conversation:
         return SimpleMessage(content)
 
     def _create_error_message(self, error_msg):
-        """Create an error message object."""
+        """构造一条错误消息对象。"""
         class ErrorMessage:
             def __init__(self, error_msg):
-                self.content = f"Sorry, I encountered a technical issue: {error_msg}"
+                self.content = f"抱歉，遇到一个技术问题：{error_msg}"
                 self.role = "assistant"
                 self.tool_calls = None
         
         return ErrorMessage(error_msg)
 
     def print_streaming_content(self, content):
-        """Delegate streaming content printing to UI manager (for compatibility)."""
+        """
+        把流式打印转发给 UI 管理器（向后兼容）。
+
+        保留这个转发方法是「向后兼容」的遗留：早期调用方可能直接
+        conversation.print_streaming_content(...)，加一层转发不至于把外部用法打断。
+        """
         self._ui_manager.print_streaming_content(content)

@@ -21,7 +21,7 @@ Chapter 7 implements a sub-agent architecture that allows the main agent to dele
 
 #### 3. Conversation Updates (`src/core/conversation.py`)
 - **New method**: `async def start_task(self, task_system_prompt, user_input)`
-- **Task depth tracking**: `_task_depth` counter tracks nesting level for nested sub-agent support
+- **Task depth tracking**: `_task_depth` counter tells a main agent from a sub-agent; it is now also used to block second-level delegation
 - **Integration**: Sub-agents run in isolated conversation sessions
 
 #### 4. HistoryManager Extensions (`src/core/history/history_manager.py`)
@@ -46,27 +46,38 @@ User Request → Main Agent → Task Tool → SubagentManager → New Conversati
 
 1. **Task Creation**: Main agent identifies complex tasks requiring delegation
 2. **Sub-agent Spawn**: Task tool creates new conversation context with specialized system prompt
-3. **Autonomous Execution**: Sub-agent runs independently with full tool access
+3. **Autonomous Execution**: Sub-agent runs independently with every tool except `task`
 4. **Result Return**: Sub-agent completes task and returns structured response
 5. **Integration**: Main agent receives results and continues workflow
 
-### 🔗 Nested Sub-Agent Support
+### 🚫 Single-Level Delegation Only (project modification)
 
-Sub-agents can delegate tasks to their own sub-agents, creating a hierarchy:
+The original implementation let sub-agents delegate further, forming a
+main → sub → sub-sub hierarchy. This project restricts delegation to the
+**main agent only**: a sub-agent must finish the work itself and report back.
 
 ```
-Main Agent (_task_depth = 0)
-  └─► Sub-agent (_task_depth = 1)
-       └─► Sub-sub-agent (_task_depth = 2)
-       ◄─┘ returns (_task_depth = 1)
-  ◄─┘ returns (_task_depth = 0)
+Main agent (_task_depth = 0)      -- tools include `task` ✔
+  └─► Sub-agent (_task_depth = 1) -- tools exclude `task` ✘ cannot delegate
+  ◄─┘ returns report, depth back to 0
 ```
 
-**Implementation Details**:
-- `_task_depth` counter replaces simple boolean flag for proper nesting
-- Incremented when entering a task, decremented when exiting
-- Prevents user input prompts in nested scenarios
-- History stack (`messages_history`) maintains separate context for each nesting level
+**Two gates (both required)**:
+
+1. `Conversation._get_available_tools()`: when `_task_depth > 0` it calls
+   `ToolManager.get_tools_description(exclude={"task"})`, so the sub-agent never
+   sees the delegation tool in its schema (no wasted attempt, no wasted tokens);
+2. `Task.act()`: returns a refusal message when `conversation.is_subagent` is true,
+   catching the case where the model ignores the schema and calls `task` anyway.
+
+Gate 2 alone would still burn a round trip; gate 1 alone cannot stop hallucinated
+calls. Together they make recursion impossible rather than merely unlikely.
+
+**What is kept**:
+
+- `_task_depth` still tracks entry/exit: it decides main-vs-sub identity and
+  prevents the sub-agent from waiting for user input when it has no tool calls left
+- The history stack (`messages_history`) still gives each sub-agent an isolated context
 
 ### 🚀 Benefits
 

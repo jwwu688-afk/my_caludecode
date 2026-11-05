@@ -1,6 +1,46 @@
-#adapt from Claude Code
+# 改编自 Claude Code
+# -*- coding: utf-8 -*-
+"""
+第 5 章 · 系统规则（system_rule.py）
+====================================
+
+这一整个文件就是一段「超长字符串」——但它比任何代码都更能决定 Agent 的行为上限。
+本项目的写法直接借鉴 Claude Code 的系统提示词，可以拆成五块来读：
+
+  1. 身份与安全边界
+       "You are Quick Star CLI…"        —— 明确角色，避免模型以通用助手口吻泛泛而谈
+       "defensive security only"       —— 安全红线：不做攻击性代码
+       "NEVER generate or guess URLs"  —— 防止幻觉出假链接（这是模型高频事故点）
+
+  2. 语气与长度（Tone and style）
+       "fewer than 4 lines"、大量 <example> 示例。
+       为什么用示例而不是规则？因为模型对「示例」的服从度远高于对「形容词」的服从度。
+       想让输出变短，给 5 个「输入 → 一句话答案」的例子，比写十遍 "be concise" 有效得多。
+
+  3. 主动性（Proactiveness）
+       "可以做，但只在用户要求时做"——这条在「答问题」与「动手改」之间划了界，
+       直接决定 Agent 是「先解释」还是「直接开干」。
+
+  4. 遵循既有约定（Following conventions）
+       改代码前先看邻近文件怎么写的、别假设某个库一定存在。
+       这是「让 Agent 融入陌生仓库」最关键的一条。
+
+  5. 引用格式（Code References）
+       要求以 `file_path:line_number` 形式引用，用户能直接跳转。
+       约束输出格式 = 提升可用性，本质也是 prompt 工程的一部分。
+
+阅读建议：不要把它当代码读，把它当「产品需求文档」读——
+凡是你不满意 Agent 行为的地方，八成能在这个字符串里找到对应的那句话，改它即可。
+"""
 
 def get_system_rule() -> str:
+    """
+    返回系统规则原文。
+
+    设计成函数而不是模块级常量，好处是：
+      - 调用时机可控（import 时不产生副作用）；
+      - 将来想按模式返回不同规则（如 plan 模式 / 只读模式）时，改函数签名即可扩展。
+    """
     return """
 You are Quick Star CLI, Anthropic's official CLI for Claude.
 You are an interactive CLI tool that helps users with software engineering tasks. Use the instructions below and the tools available to you to assist the user.

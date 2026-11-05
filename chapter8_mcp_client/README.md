@@ -78,7 +78,7 @@ QuickStar CLI → MCP Client → MCP Servers (Weather, Calculator, etc.)
    - Provides weather forecast and alerts functionality
    - Tools: `get_forecast`, `get_alerts`
 
-2. **Calculator Server** (`src/mcp_servers/caculator.py`)
+2. **Calculator Server** (`src/mcp_servers/calculator.py`)
    - Provides mathematical calculation capabilities
    - Tools: `adder` for basic arithmetic
 
@@ -104,7 +104,7 @@ chapter8_mcp_client/
 │   └── mcp_servers/            # New: Sample MCP servers
 │       ├── mcp.json           # Server configuration
 │       ├── weather.py         # Weather MCP server
-│       └── caculator.py       # Calculator MCP server
+│       └── calculator.py       # Calculator MCP server
 ```
 
 ### 🔄 How It Works
@@ -117,3 +117,17 @@ chapter8_mcp_client/
 6. **Response**: Results from MCP tools are processed and presented to the user
 
 This implementation showcases how MCP can extend an AI assistant's capabilities while maintaining clean separation between core functionality and external integrations.
+
+### 🔒 Delegation Permission (inherited from Chapter 7)
+
+Only the **main agent** may call `task`; a sub-agent cannot delegate further.
+MCP tools (`get_alerts` / `get_forecast` / `adder`) remain available to sub-agents,
+while `task` is filtered out:
+
+```
+Main agent: 7 tools (4 built-in + 3 MCP)
+Sub-agent : 6 tools (task excluded)
+```
+
+Two gates: `Conversation._get_available_tools()` filters at the schema level,
+and `Task.act()` refuses at runtime as a second line of defense.

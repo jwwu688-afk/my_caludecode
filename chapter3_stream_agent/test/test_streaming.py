@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Simple test script to verify streaming functionality
+一个简单的脚本，验证流式功能是否可用
 """
 import sys
 import os
 
-# Add src directory to path
+# 把 src 目录加入模块搜索路径
 current_dir = os.path.dirname(os.path.abspath(__file__))
 src_path = os.path.join(current_dir, '../src')
 sys.path.insert(0, src_path)
@@ -13,20 +13,20 @@ sys.path.insert(0, src_path)
 from core.api_client import APIClient
 
 def test_streaming():
-    """Test the streaming API functionality"""
+    """测试流式接口功能"""
     print("🧪 Testing streaming functionality...")
     
     try:
         client = APIClient()
         
-        # Verify the method exists
+        # 确认方法存在
         if not hasattr(client, 'get_completion_stream'):
             print("❌ get_completion_stream method not found!")
             return False
         
         print("✅ Streaming method found")
         
-        # Simple test request
+        # 一个简单的测试请求
         request_params = {
             "messages": [
                 {"role": "system", "content": "You are a helpful assistant."},
@@ -38,7 +38,7 @@ def test_streaming():
         print("📝 Streaming response:")
         print("🤖 ", end="", flush=True)
         
-        # Test the streaming generator
+        # 测试流式生成器
         stream_gen = client.get_completion_stream(request_params)
         full_content = ""
         message_obj = None

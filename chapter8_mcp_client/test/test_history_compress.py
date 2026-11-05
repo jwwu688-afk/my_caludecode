@@ -3,10 +3,10 @@ import os
 from dataclasses import dataclass
 import traceback
 
-# Add src to path
+# 把 src 加入搜索路径
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
-# Import directly from the history module to avoid other dependencies
+# 直接从 history 模块导入，避免引入其他依赖
 from core.history.history_manager import HistoryManager, TokenUsage, Role
 
 
@@ -72,7 +72,7 @@ def test_auto_compression_multiple_sessions():
     
     manager.update_token_usage(MockTokenUsage(100000, 70000, 170000))  # 170000 > 80% of 200*1024 (163840)
     
-    # Check if compression is required
+    # 检查是否满足压缩条件
     print(f"Requires compression: {manager._requires_compression()}")
     print(f"Threshold: {manager._compress_threshold * manager._model_max_tokens}")
     print(f"Current usage: {manager.history_token_usage[-1].total_tokens}")
@@ -82,7 +82,7 @@ def test_auto_compression_multiple_sessions():
     
     messages = manager.get_current_messages()
     
-    # Debug: Print all messages to see what happened
+    # 调试用：把所有消息打出来看看发生了什么
     print(f"Total messages after compression: {len(messages)}")
     for i, msg in enumerate(messages):
         print(f"  {i}: {msg.role} - {msg.content}")
